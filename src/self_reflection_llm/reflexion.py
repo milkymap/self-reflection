@@ -1,11 +1,13 @@
 import asyncio
+import yaml 
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ParsedChatCompletion
 
 from .system_instructions import SystemInstructions
 from .settings.credentials import Credentials
-from .types import OpenaiModel
+from .types import OpenaiModel, ChatMessage
+from typing import List 
 
 from tiktoken import encoding_for_model
 from .log import logger
@@ -50,11 +52,10 @@ class Reflexion:
         self.self_reflection_model = self_reflection_model
         self.openai_client = AsyncOpenAI(api_key=self.credentials.OPENAI_API_KEY)
 
-    def group_trajectory_by_page(self, trajectory:list[str], page_token_size:int=128000) -> list[str]:
+    def group_trajectory_by_page(self, trajectory:list[str], page_token_size:int=128_000) -> list[str]:
         tokenizer = encoding_for_model(model_name="gpt-4o")
         nb_tokens_per_step = [ len(tokenizer.encode(text=step)) for step in trajectory ]
 
-        print(f"Total tokens: {sum(nb_tokens_per_step)}")
         
         pages = []
         current_page = []
@@ -72,7 +73,9 @@ class Reflexion:
         if current_page:
             pages.append("\n".join(current_page))
         
-        print(f"Number of pages: {len(pages)}")
+        print("+++++Compactify+++++")
+        print(f"Total tokens: {sum(nb_tokens_per_step)}")
+        print(f"Number of pages: {len(pages)} with page token size = {page_token_size} tokens")
         return pages
 
     async def summarize_page(self, page: str) -> str:
@@ -82,7 +85,7 @@ class Reflexion:
                 {"role": "system", "content": SystemInstructions.TRAJECTORY_SUMMARIZATION_PROMPT.value},
                 {"role": "user", "content": page}
             ],
-            max_tokens=16384,
+            max_tokens=16_384,  # make it a variable for the next version
         )
         return response.choices[0].message.content
 
@@ -92,10 +95,11 @@ class Reflexion:
             page_token_size:int=128_000,
             ) -> str:
         pages = self.group_trajectory_by_page(trajectory, page_token_size)
-        
         summaries = await asyncio.gather(*[self.summarize_page(page) for page in pages])
-        for summary in summaries:
+        for page_id, summary in enumerate(summaries):
+            print(f'summary of page {page_id + 1}')
             print(summary)
+            print('-------------------------------')
     
         return "\n".join(summaries)
 
@@ -137,7 +141,6 @@ class Reflexion:
 
         parsed_response:Evaluation = response.choices[0].message.parsed
         return parsed_response.score, parsed_response.reasoning
-
 
     async def self_reflect(
             self,
@@ -186,6 +189,41 @@ class Reflexion:
         )
         
         return response.choices[0].message.content
+    
+    async def process(self, task:str, conversation:List[ChatMessage], page_token_size:int, reflexion_feedbacks:List[str]): 
+        trajectory = []
+        for msg in conversation:
+            trajectory.append(msg.model_dump_json(indent=3))
+            
+        trajectory_summary = await self.summarize_trajectory(
+            trajectory=trajectory, page_token_size=page_token_size
+        )
+        evaluation_score, evaluation_reasoning = await self.evaluate_trajectory(
+            query=task, trajectory_summary=trajectory_summary
+        )
+        
+        print(yaml.dump({
+            "score": evaluation_score,
+            "reason": evaluation_reasoning
+        }))
+
+        if evaluation_score:
+            return evaluation_score, evaluation_reasoning, reflexion_feedbacks
+        
+        joined_feedbacks = "\n###\n".join(reflexion_feedbacks)
+        feedback = await self.self_reflect(
+            query=task, trajectory_summary=trajectory_summary,
+            evaluation_score=evaluation_score, evaluation_reasoning=evaluation_reasoning,
+            previous_reflection=joined_feedbacks
+        )
+        print("reflexion")
+        print(feedback)
+
+        reflexion_feedbacks.append(feedback)
+        return evaluation_score, evaluation_reasoning, reflexion_feedbacks
+    
+        
+        
 
 
 
