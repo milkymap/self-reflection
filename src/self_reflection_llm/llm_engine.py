@@ -89,28 +89,33 @@ class LLMEngine:
         apply_tool_call: Execute single tool call
     """
 
-    def __init__(self, credentials:Credentials, mcp_settings:List[McpSettings], models:LLMModels, page_token_size:int=128000):
+    def __init__(
+            self, 
+            credentials:Credentials, 
+            mcp_settings:List[McpSettings], 
+            models:LLMModels, 
+            page_token_size:int=128000, 
+            max_iterations:int=3,
+            ):
         self.credentials = credentials 
         self.mcp_settings = mcp_settings 
         self.models = models 
-        self.state = AgentState.PRE_AGENT_LOOP
-        self.plan_steps:List[str] = []
-        self.tool_choice:str = "auto"
         self.reflexion = Reflexion(
             credentials=self.credentials,
             summary_model=self.models.summarizer,
             evaluation_model=self.models.evaluator,
             self_reflection_model=self.models.self_reflection
         )
-        self.conversation:List[ChatMessage] = []
-        self.trajectory:List[str] = []
         self.page_token_size = page_token_size
-        self.reflexion_feedbacks:List[str] = []
-        self.task:str = None 
-        self.index_of_agent_loop_start:Optional[int] = None 
+        self.max_iterations = max_iterations 
+        
+        self.state = AgentState.PRE_AGENT_LOOP
+        self.tool_choice:str = "auto"  # can be auto | required | none 
+        
+        self.task:str = None # store the query of the user 
         self.iteration_count:int = 0 
-        self.max_iterations:int = 3 
-
+        self.reflexion_feedbacks:List[str] = []
+        
         
     async def __aenter__(self) -> Self:
         self.openai_client = AsyncOpenAI(api_key=self.credentials.OPENAI_API_KEY)
@@ -121,7 +126,9 @@ class LLMEngine:
         await self.mcp_router.start_all_mcp_servers()
         mcp_tools = self.mcp_router.list_all_tools()
         
-        TOOLS["think"]["function"]["parameters"]["properties"]["next_tool"]["properties"]["name"]["enum"].extend([tool.name for tool in mcp_tools])
+        TOOLS["think"]["function"]["parameters"]["properties"]["next_tool"]["properties"]["name"]["enum"].extend(
+            [tool.name for tool in mcp_tools]
+        )
         actions = []
         for tool in mcp_tools:
             actions.append({
@@ -135,8 +142,8 @@ class LLMEngine:
         
 
         self.agent_state2tools_hmap:Dict[AgentState, List[Dict[str, Any]]] = {
-            AgentState.PLAN: [TOOLS['generate_plan']],
             AgentState.PRE_AGENT_LOOP: [TOOLS['start_agent_loop']],
+            AgentState.PLAN: [TOOLS['generate_plan']],
             AgentState.AGENT_LOOP: [TOOLS['exit_agent_loop'], TOOLS["think"], TOOLS['move_to_next_step'], *actions],
             AgentState.EXIT_AGENT_LOOP: [], # no tools to call in this state
         }
@@ -156,20 +163,39 @@ class LLMEngine:
                 raise ValueError("reasoning_effort is required for O4_MINI, O3_MINI, O3")
             assert reasoning_effort in ["low", "medium", "high"], "reasoning_effort must be one of low, medium, high"
 
-
+        conversation:List[ChatMessage] = []
         stop_reason = StopReason.STOP 
         while True:
             try:
                 if stop_reason != StopReason.TOOL_CALLS:
-                    query = input('> ')
+                    match self.state:
+                        case AgentState.EXIT_AGENT_LOOP:  
+                            # eval the trajectory and check if a new iteration is needed or not 
+                            evaluation_score, evaluation_reasoning, reflexion_feedbacks_updated = await self.reflexion.process(
+                                task=self.task, conversation=conversation, 
+                                page_token_size=self.page_token_size, reflexion_feedbacks=self.reflexion_feedbacks
+                            )  
+                            feedback_signal = self.update_state(
+                                evaluation_score, evaluation_reasoning, reflexion_feedbacks_updated
+                            )
+                            if feedback_signal is None:
+                                logger.info('agent was able to fully complete the task')
+                                continue  # new loop with a clean agent state => user will take the turn
+                            logger.info('a new iteration will start with reflection feedback')
+                            query = feedback_signal
+                        case _:
+                            query = input('> ')  # user prompt 
+                    
                     self.conversation.append(ChatMessage(role=Role.USER, content=query))
                 response = await self.generate_response(
                     max_tokens=max_tokens, 
                     reasoning_effort=reasoning_effort, 
-                    parallel_tool_calls=parallel_tool_calls
+                    parallel_tool_calls=parallel_tool_calls, 
+                    conversation=conversation
                 )
-                delta_stop_reason = await self.consume_response(response)
+                delta_stop_reason, delta_conversation = await self.consume_response(response)
                 stop_reason = delta_stop_reason 
+                conversation.extend(delta_conversation)
                 print('\n')
             except asyncio.CancelledError:
                 break 
@@ -177,13 +203,57 @@ class LLMEngine:
                 logger.error(f"Error in run_loop: {e}")
                 break 
     
-    async def generate_response(self, max_tokens:int=1024, reasoning_effort:Optional[str]=None, parallel_tool_calls:bool=False) -> AsyncGenerator[ChatCompletionChunk, None]:
+    def reset_agent_state(self) -> None:
+        self.state = AgentState.PRE_AGENT_LOOP
+        self.task = None
+        self.iteration_count = 0
+
+    def update_state(self, evaluation_score:bool, evaluation_reasoning:str, reflexion_feedbacks_updated:List[str]) -> Optional[str]:
+        # current agent state is exit_agent_loop
+        # this function will set the agent state to either pre_agent_loop(success) or plan(failure)
+        if evaluation_score:  # True => agent has passed the task
+            self.reset_agent_state()  # agent is ready for a new task 
+            return None 
+        
+        if self.iteration_count == self.max_iterations:
+            logger.warning(f'agent was not able to solve this task after {self.max_iterations} attempts')
+            self.reset_agent_state()
+            return None 
+        # start again the agent loop without new task or confirmation... jump to generate plan step(this is like a backtrack)
+        self.reflexion_feedbacks = reflexion_feedbacks_updated
+        self.state = AgentState.PLAN  # activate the `plan -> agent_loop` sequence again
+        self.tool_choice = "required"
+        return yaml.dump({
+            "trajectory_scoring": {
+                "pass/fail": "failed",
+                "reason": evaluation_reasoning
+            },
+            "feedback_signal": self.reflexion_feedbacks[-1], 
+            "tips": "check your previous plan, if needed, you can update it with a backtrack. this is optional",
+            "message": "please, in this new iteration, try to correct your trajectory by taking into account the given feedback"
+        })
+
+    async def generate_response(
+            self, 
+            max_tokens:int=1024, 
+            reasoning_effort:Optional[str]=None, 
+            parallel_tool_calls:bool=False, 
+            conversation:List[ChatMessage]=[]
+            ) -> AsyncGenerator[ChatCompletionChunk, None]:
+        
+
+        match self.state:
+            case AgentState.PLAN | AgentState.AGENT_LOOP:
+                system_prompt = SystemInstructions.ACTOR_PROMPT.value 
+            case _: 
+                system_prompt = SystemInstructions.CONVERSATIONAL_PROMPT.value.format(
+                    services=", ".join(self.mcp_router.list_all_services())
+                )
+
         system_message = [
             ChatMessage(
                 role=Role.SYSTEM,
-                content=SystemInstructions.ACTOR_PROMPT.value if self.state in [AgentState.PLAN, AgentState.AGENT_LOOP] else SystemInstructions.CONVERSATIONAL_PROMPT.value.format(
-                    services=", ".join(self.mcp_router.list_all_services())
-                )
+                content=system_prompt
             )
         ]
 
@@ -210,14 +280,15 @@ class LLMEngine:
                 tool_choice=self.tool_choice
             )
         response:AsyncGenerator[ChatCompletionChunk, None] = await partial_completion(
-            messages=system_message + self.conversation,
+            messages=system_message + conversation,
         )  
         return response 
 
-    async def consume_response(self, response:AsyncGenerator[ChatCompletionChunk, None]) -> StopReason:
+    async def consume_response(self, response:AsyncGenerator[ChatCompletionChunk, None]) -> Tuple[StopReason, List[ChatMessage]]:
         content = ''
         tool_call_accumulator:Dict[int, ChatCompletionMessageToolCall] = {}
         stop_reason = StopReason.STOP 
+        conversation:List[ChatMessage] = []
         async for chunk in response:
             if chunk.choices[0].finish_reason is not None:
                 stop_reason = chunk.choices[0].finish_reason
@@ -232,11 +303,11 @@ class LLMEngine:
                     content=content,
                     tool_calls=tool_calls
                 )
-                self.conversation.append(assistant_message)
+                conversation.append(assistant_message)
                 match stop_reason:
                     case StopReason.TOOL_CALLS:
                         tool_calls_result = await self.handle_tool_calls(tool_calls)
-                        self.conversation.extend(tool_calls_result)
+                        conversation.extend(tool_calls_result)
                     case _:
                         break 
             
@@ -250,15 +321,10 @@ class LLMEngine:
                 if not tool_call.index in tool_call_accumulator:
                     tool_call_accumulator[tool_call.index] = tool_call
                 tool_call_accumulator[tool_call.index].function.arguments += tool_call.function.arguments
-        return stop_reason 
+        return stop_reason, conversation 
     
     async def handle_tool_calls(self, tool_calls:List[Dict[str, Any]]) -> List[ChatMessage]:
         tool_calls_results = await asyncio.gather(*[self.apply_tool_call(tool_call) for tool_call in tool_calls])
-        for tool_call, tool_call_result in zip(tool_calls, tool_calls_results):
-            self.trajectory.append(json.dumps({
-                "action": tool_call,
-                "observation": tool_call_result.model_dump()
-            }, indent=3))
         return tool_calls_results 
 
     async def apply_tool_call(self, tool_call:Dict[str, Any]) -> ChatMessage:
@@ -275,7 +341,8 @@ class LLMEngine:
                 case 'generate_plan' | 'start_agent_loop' | 'exit_agent_loop' | 'move_to_next_step' | 'think':
                     fn_ = attrgetter(function_name)(self) 
                     tool_call_result_content = await fn_(**function_arguments)
-                case _:
+                case _:  # calling an mcp tool (dynamic mapping) can scale to a vast number of mcp servers
+                    # due to the mcp router capabilities (multiple mcp servers mounted)
                     tool_call_result_content = await self.mcp_router.higher_order_apply(
                         tool_call_name=function_name,
                         tool_call_arguments=function_arguments
@@ -296,10 +363,9 @@ class LLMEngine:
     
 
     async def start_agent_loop(self, task:str, confirmation:str) -> str:
-        self.state = AgentState.PLAN
-        self.tool_choice = "required"
-        self.task = task 
-        self.index_of_agent_loop_start = len(self.conversation) + 1  # +1 because of the tool call result of the start_agent_loop tool call
+        self.state = AgentState.PLAN  # next action should be plan generation 
+        self.tool_choice = "required"  # tool call is mandatory
+        self.task = task # keep the task of the user as query for evaluation part 
         return yaml.dump({
             "setup": {
                 "task": task,
@@ -308,28 +374,25 @@ class LLMEngine:
             "message": "the agent loop was started successfully, please generate a plan"
         }, sort_keys=False)
     
-
     async def generate_plan(self, steps:List[str], justification:str) -> str:
-        self.state = AgentState.AGENT_LOOP
-        self.plan_steps = steps
+        self.state = AgentState.AGENT_LOOP  # starting the agent_loop(exit_agent_loop, think, move_to_next_step, *action)
         return yaml.dump({
             "generated_plan": {
                 "steps": steps,
                 "justification": justification
             },
-            "message": "the plan was generated successfully, please execute the plan, always think before you act"
+            "message": "the plan was generated successfully, please execute the plan, always think before you act. once you complete a step, move to the next step"
         }, sort_keys=False)
 
     async def think(self, thought:str, next_tool:Dict[str, Any]) -> str:
         print(thought)
         return yaml.dump({
             "next_tool_to_call": next_tool,
-            "message": "the next tool to call was selected successfully, please call the tool with appropriate arguments"
+            "message": "the next tool to call was selected successfully, please call the tool with appropriate arguments."
         }, sort_keys=False)
     
     async def move_to_next_step(self, completed_step:str, next_step:str) -> str:
         return yaml.dump({
-            "initial_plan": self.plan_steps,
             "completed_step": completed_step,
             "next_step": next_step,
             "message": f"the next step {next_step} was selected successfully, please execute the next step"
@@ -337,67 +400,14 @@ class LLMEngine:
 
     async def exit_agent_loop(self, reason:str) -> str:
         print(reason)   
-        trajectory_summary = await self.reflexion.summarize_trajectory(
-            trajectory=self.trajectory,
-            page_token_size=self.page_token_size
-        )
-        evaluation_score, evaluation_reasoning = await self.reflexion.evaluate_trajectory(
-            query=self.task,
-            trajectory_summary=trajectory_summary
-        )
-        print("evaluation_score", evaluation_score)
-        print("evaluation_reasoning", evaluation_reasoning)
-        if evaluation_score:
-            self.state = AgentState.EXIT_AGENT_LOOP
-            self.tool_choice = None
-            return yaml.dump({
-                "evaluation": {
-                    "score": evaluation_score,
-                    "reasoning": evaluation_reasoning
-                },
-                "message": "the agent loop was exited successfully, please talk to the user about the results"
-            }, sort_keys=False)
-        
-        self.iteration_count = self.iteration_count + 1
-        if self.iteration_count == self.max_iterations:
-            self.state = AgentState.EXIT_AGENT_LOOP
-            self.tool_choice = None
-            return yaml.dump({
-                "evaluation": {
-                    "score": evaluation_score,
-                    "reasoning": evaluation_reasoning
-                },
-                "message": "the agent loop was not able to complete the task, please try again by taking into account the feedback"
-            }, sort_keys=False)
-        
-        joined_feedbacks = "\n".join(self.reflexion_feedbacks)
-        feedback = self.reflexion.self_reflect(
-            query=self.task,
-            trajectory_summary=trajectory_summary,
-            evaluation_score=evaluation_score,
-            evaluation_reasoning=evaluation_reasoning,
-            previous_reflection=joined_feedbacks
-        )
-        print("feedback", feedback)
-        self.reflexion_feedbacks.append(feedback)
-        self.conversation = self.conversation[:self.index_of_agent_loop_start]  # remove the agent loop messages
-        self.trajectory = []
-        self.state = AgentState.PLAN
-
-        # replace it with the exit_agent_loop tool call result
+        self.state = AgentState.EXIT_AGENT_LOOP  # no more tool call
+        self.tool_choice = None # force the LLM to generate a final response 
+        self.iteration_count += 1 # iteration completed 
         return yaml.dump({
-            "past_trajectory": trajectory_summary,
-            "evaluation": {
-                "score": evaluation_score,
-                "reasoning": evaluation_reasoning
-            },
-            "feedback": feedback,
-            "iteration_count": self.iteration_count,
-            "max_iterations": self.max_iterations,
-            "previous_plan": self.plan_steps,
-            "message": "the agent loop was not able to complete the task, please try again by taking into account the feedback. correct your plan and try new actions"
-        }, sort_keys=False)
-
+            "iterations_left": self.max_iterations - self.iteration_count,
+            "context": "each agent loop is an iteration, in case of failure, the next iteration will be called with some user feedback",  
+            "end_of_agent_loop": "the agent loop was stopped, please generate the final result if you succeeded else, tell the user the reason why you were not able to build the result"
+        })
         
     
     
