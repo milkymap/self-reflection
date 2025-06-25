@@ -135,7 +135,7 @@ TOOLS: Dict[str, Dict] = {
                     "reason": {
                         "type": "string",
                         "description": "The reason for ending the agent loop",
-                    }
+                    }, 
                 },
                 "required": ["reason"],
             },
