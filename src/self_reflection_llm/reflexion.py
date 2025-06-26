@@ -108,6 +108,7 @@ class Reflexion:
             self,
             query:str, 
             trajectory_summary:str, 
+            final_res:str, 
             ) -> tuple[bool, str]:
         class Evaluation(BaseModel):
             score: bool = Field(description="The evaluation of the trajectory. true(pass) or false(fail).")
@@ -130,6 +131,10 @@ class Reflexion:
                         {
                             "type": "text",
                             "text": f"Assistant Trajectory: {trajectory_summary}"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"Final Result of the agent: {final_res}"
                         }
                     ]
                 }
@@ -194,18 +199,26 @@ class Reflexion:
         trajectory = []
         for msg in conversation:
             trajectory.append(msg.model_dump_json(indent=3))
-            
+
+        final_res = trajectory[-1]
+        print(f'final result of the agent: {final_res}')
         trajectory_summary = await self.summarize_trajectory(
-            trajectory=trajectory, page_token_size=page_token_size
+            trajectory=trajectory, 
+            page_token_size=page_token_size
         )
         evaluation_score, evaluation_reasoning = await self.evaluate_trajectory(
-            query=task, trajectory_summary=trajectory_summary
+            query=task, 
+            trajectory_summary=trajectory_summary, 
+            final_res=final_res
         )
         
-        print(yaml.dump({
-            "score": evaluation_score,
-            "reason": evaluation_reasoning
-        }))
+        print(yaml.dump(
+            {
+                "score": evaluation_score,
+                "reason": evaluation_reasoning
+            }, 
+            sort_keys=False
+        ))
 
         if evaluation_score:
             return evaluation_score, evaluation_reasoning, reflexion_feedbacks

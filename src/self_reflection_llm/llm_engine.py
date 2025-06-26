@@ -171,12 +171,17 @@ class LLMEngine:
                     match self.state:
                         case AgentState.EXIT_AGENT_LOOP:  
                             # eval the trajectory and check if a new iteration is needed or not 
-                            evaluation_score, evaluation_reasoning, reflexion_feedbacks_updated = await self.reflexion.process(
-                                task=self.task, conversation=conversation, 
-                                page_token_size=self.page_token_size, reflexion_feedbacks=self.reflexion_feedbacks
+                            reflexion_process = self.reflexion.process(
+                                task=self.task, 
+                                conversation=conversation, 
+                                page_token_size=self.page_token_size, 
+                                reflexion_feedbacks=self.reflexion_feedbacks
                             )  
+                            evaluation_score, evaluation_reasoning, reflexion_feedbacks_updated = await reflexion_process
                             feedback_signal = self.update_state(
-                                evaluation_score, evaluation_reasoning, reflexion_feedbacks_updated
+                                evaluation_score, 
+                                evaluation_reasoning, 
+                                reflexion_feedbacks_updated
                             )
                             if feedback_signal is None:
                                 logger.info('agent was able to fully complete the task')
@@ -186,7 +191,7 @@ class LLMEngine:
                         case _:
                             query = input('> ')  # user prompt 
                     
-                    self.conversation.append(ChatMessage(role=Role.USER, content=query))
+                    conversation.append(ChatMessage(role=Role.USER, content=query))
                 response = await self.generate_response(
                     max_tokens=max_tokens, 
                     reasoning_effort=reasoning_effort, 
