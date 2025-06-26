@@ -129,9 +129,9 @@ class LLMEngine:
         TOOLS["think"]["function"]["parameters"]["properties"]["next_tool"]["properties"]["name"]["enum"].extend(
             [tool.name for tool in mcp_tools]
         )
-        actions = []
+        self.actions = []
         for tool in mcp_tools:
-            actions.append({
+            self.actions.append({
                 "type": "function",
                 "function": {
                     "name": tool.name,
@@ -144,7 +144,7 @@ class LLMEngine:
         self.agent_state2tools_hmap:Dict[AgentState, List[Dict[str, Any]]] = {
             AgentState.PRE_AGENT_LOOP: [TOOLS['start_agent_loop']],
             AgentState.PLAN: [TOOLS['generate_plan']],
-            AgentState.AGENT_LOOP: [TOOLS['exit_agent_loop'], TOOLS["think"], TOOLS['move_to_next_step'], *actions],
+            AgentState.AGENT_LOOP: [TOOLS['exit_agent_loop'], TOOLS["think"], TOOLS['move_to_next_step'], *self.actions],
             AgentState.EXIT_AGENT_LOOP: [], # no tools to call in this state
         }
 
